@@ -1,0 +1,7 @@
+# Datos de prueba del proyecto (contienen información real).
+# No deben subirse a un repositorio público de GitHub Pages.
+/data/
+
+# Archivos de sistema
+.DS_Store
+Thumbs.db

@@ -132,6 +132,15 @@
   .dropzone .dz-label strong{ color: var(--text); }
   .dropzone.has-file{ border-style: solid; border-color: var(--success); background: var(--success-soft); }
   .dropzone.has-file .dz-label{ color: var(--text); }
+  .dropzone.loading{ border-color: var(--accent); background: var(--accent-soft); pointer-events:none; cursor:default; }
+  .dropzone.loading input[type=file]{ pointer-events:none; }
+  .dropzone.loading .dz-label{ color: var(--text); }
+  .dz-spin{
+    display:inline-block; width:13px; height:13px; margin-right:6px; vertical-align:-2px;
+    border-radius:50%; border:2px solid var(--border); border-top-color: var(--accent);
+    animation: dz-spin-rot .7s linear infinite;
+  }
+  @keyframes dz-spin-rot{ to{ transform: rotate(360deg); } }
 
   .dz-clear{
     position:absolute; top:6px; left:6px; z-index:2;
@@ -1850,16 +1859,44 @@ const FLG = (function () {
     });
     function handleFile(file) {
       const isExcel = /\.(xlsx|xls)$/i.test(file.name);
+      // El parseo (FLG.parseCSV/parseWorkbook) corre síncrono en el hilo
+      // principal y puede tardar varios segundos con archivos de cientos de
+      // MB / millones de filas, sin poder repintar nada mientras tanto. Por
+      // eso se muestra un indicador de "Cargando..." ANTES de arrancar esa
+      // lectura: el navegador sí llega a pintarlo, porque `readAsText`/
+      // `readAsArrayBuffer` son asíncronos (hay un hueco real, el tiempo de
+      // lectura del archivo, entre este punto y el trabajo pesado dentro de
+      // `onload`) — así el usuario ve que el clic/drop se registró y que
+      // toca esperar, en vez de ver la pantalla "pegada" sin ninguna señal.
+      const labelEl = dz.querySelector('.dz-label');
+      const prevHtml = labelEl ? labelEl.innerHTML : null;
+      dz.classList.add('loading');
+      if (labelEl) labelEl.innerHTML = '<span class="dz-spin"></span><strong>Cargando ' + escapeHtml(file.name) + '…</strong><br>puede tardar varios segundos si el archivo es grande';
+      function restoreLabel() {
+        dz.classList.remove('loading');
+        if (labelEl && prevHtml !== null) labelEl.innerHTML = prevHtml;
+      }
       const reader = new FileReader();
       reader.onload = () => {
         let parsed;
-        if (isExcel) {
-          parsed = FLG.parseWorkbook(reader.result);
-        } else {
-          parsed = FLG.parseCSV(String(reader.result));
+        try {
+          if (isExcel) {
+            parsed = FLG.parseWorkbook(reader.result);
+          } else {
+            parsed = FLG.parseCSV(String(reader.result));
+          }
+        } catch (err) {
+          restoreLabel();
+          alert('No se pudo leer "' + file.name + '": ' + err.message);
+          return;
         }
+        restoreLabel();
         dz.classList.add('has-file');
         onFile(file, parsed);
+      };
+      reader.onerror = () => {
+        restoreLabel();
+        alert('No se pudo leer el archivo "' + file.name + '".');
       };
       if (isExcel) reader.readAsArrayBuffer(file);
       else reader.readAsText(file, 'UTF-8');
@@ -3090,43 +3127,62 @@ const FLG = (function () {
   document.getElementById('searchBoxVol').addEventListener('input', (e) => { searchTermVol = e.target.value.trim(); renderTableVol(); });
 
   // ---- EXPORT (Modo 4) ----
-  function buildExportRowsVol() {
-    const headers = state4.blocks.headers.concat(state4._colNames).concat([state4._summaryColName]);
-    return state4.results.map((r) => {
-      const o = {};
-      for (const h of headers) o[h] = (r[h] === null || r[h] === undefined) ? '' : r[h];
-      return o;
-    });
-  }
+  // Nota de memoria: las dos exportaciones leen directamente de
+  // `state4.results` (que ya son las filas del modelo de bloques, mutadas
+  // in-place con las columnas nuevas — ver handler de "Clasificar
+  // bloques") en vez de construir un arreglo paralelo de objetos nuevos
+  // (`rows.map(...)`) como se hacía antes. Con 2.6 millones de bloques esa
+  // copia adicional, justo después de la clasificación (que ya deja la
+  // memoria ajustada), era la causa más probable de que la pestaña quedara
+  // en blanco al exportar.
+  const XLSX_MAX_ROWS = 1048575; // límite real de Excel: 1,048,576 filas por hoja, menos la fila de encabezado
 
   document.getElementById('btnExportXlsxVol').addEventListener('click', () => {
     if (!state4.results) return;
+    if (state4.results.length > XLSX_MAX_ROWS) {
+      alert('El modelo tiene ' + state4.results.length.toLocaleString() + ' bloques, más de los ' + XLSX_MAX_ROWS.toLocaleString() + ' que soporta una hoja de Excel (.xlsx). Usa "Descargar CSV" en su lugar — no tiene ese límite y es más liviano para archivos así de grandes.');
+      return;
+    }
+    const headers = state4.blocks.headers.concat(state4._colNames).concat([state4._summaryColName]);
     const wb = XLSX.utils.book_new();
-    const ws = XLSX.utils.json_to_sheet(buildExportRowsVol());
+    const ws = XLSX.utils.json_to_sheet(state4.results, { header: headers });
     XLSX.utils.book_append_sheet(wb, ws, 'Modelo clasificado');
     XLSX.writeFile(wb, 'flageador_bloques_volumenes.xlsx');
   });
 
+  function csvCellVol(v) {
+    if (v === null || v === undefined) v = '';
+    v = String(v);
+    if (v.includes(';') || v.includes('"') || v.includes('\n')) v = '"' + v.replace(/"/g, '""') + '"';
+    return v;
+  }
+
   document.getElementById('btnExportCsvVol').addEventListener('click', () => {
-    if (!state4.results) return;
-    const rows = buildExportRowsVol();
-    if (!rows.length) return;
-    const headers = Object.keys(rows[0]);
-    const lines = [headers.join(';')];
-    for (const r of rows) {
-      lines.push(headers.map((h) => {
-        let v = r[h];
-        if (v === null || v === undefined) v = '';
-        v = String(v);
-        if (v.includes(';') || v.includes('"') || v.includes('\n')) v = '"' + v.replace(/"/g, '""') + '"';
-        return v;
-      }).join(';'));
+    if (!state4.results || !state4.results.length) return;
+    const headers = state4.blocks.headers.concat(state4._colNames).concat([state4._summaryColName]);
+    const rows = state4.results;
+    // Se acumulan las líneas como partes de Blob separadas en vez de
+    // armar un solo string gigante con lines.join('\n'): un Blob puede
+    // recibir un arreglo de miles/millones de strings pequeños sin que el
+    // motor JS tenga que reservar de una vez un único bloque de memoria
+    // contiguo del tamaño completo del CSV (que para 2.6M filas puede ser
+    // de varios cientos de MB), evitando ese pico de asignación única.
+    const parts = ['﻿' + headers.map(csvCellVol).join(';') + '\n'];
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      let line = '';
+      for (let j = 0; j < headers.length; j++) {
+        if (j) line += ';';
+        line += csvCellVol(r[headers[j]]);
+      }
+      parts.push(line + '\n');
     }
-    const blob = new Blob(['﻿' + lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+    const blob = new Blob(parts, { type: 'text/csv;charset=utf-8;' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = 'flageador_bloques_volumenes.csv';
     a.click();
+    URL.revokeObjectURL(a.href);
   });
 
   // ============================================================================

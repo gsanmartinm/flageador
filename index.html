@@ -189,6 +189,8 @@
   }
   .checklist label:hover{ background: var(--bg-panel-2); }
   .checklist input[type=checkbox]{ accent-color: var(--accent); }
+  .check-field{ display:flex; align-items:center; gap:8px; font-size:13px; color: var(--text); cursor:pointer; }
+  .check-field input[type=checkbox]{ accent-color: var(--accent); width:15px; height:15px; flex-shrink:0; }
   .checklist .type-tag{ margin-left:auto; font-size:9.5px; color:var(--text-faint); font-family:var(--mono); }
 
   .btn{
@@ -811,6 +813,10 @@
       </div>
     </div>
     <div class="helptext">Además de la columna resumen, se agrega una columna "dentro__&lt;valor del volumen&gt;" (sí/no) por cada volumen cargado, usando el "Valor" que le hayas asignado a cada uno en la lista de volúmenes.</div>
+    <div class="field-row" style="margin-top:14px;">
+      <label class="check-field"><input type="checkbox" id="volExportOnlyInside"><span>Exportar solo los bloques que quedaron dentro de algún volumen</span></label>
+    </div>
+    <div class="helptext">Reduce mucho el archivo de salida cuando la mayoría de los bloques queda "fuera" — útil para cruzar el resultado en R/Python sin cargar el modelo completo. Esto solo afecta lo que se descarga (Excel/CSV); la tabla y el resumen en pantalla siguen mostrando todos los bloques.</div>
   </div>
 
   <!-- STEP 3 -->
@@ -3137,17 +3143,63 @@ const FLG = (function () {
   // en blanco al exportar.
   const XLSX_MAX_ROWS = 1048575; // límite real de Excel: 1,048,576 filas por hoja, menos la fila de encabezado
 
-  document.getElementById('btnExportXlsxVol').addEventListener('click', () => {
+  // Deja el botón clickeado en estado "ocupado" (deshabilitado + texto)
+  // ANTES de arrancar el trabajo pesado, y difiere ese trabajo un tick con
+  // setTimeout: como todo lo que sigue es síncrono, sin el setTimeout el
+  // navegador nunca llega a pintar el cambio de texto/estado antes de
+  // congelarse — con el setTimeout sí, porque el repintado ocurre en el
+  // hueco entre "termina este evento" y "arranca el timeout".
+  function runBusy(btn, busyText, fn) {
+    const prevText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = busyText;
+    setTimeout(() => {
+      try { fn(); }
+      finally { btn.disabled = false; btn.textContent = prevText; }
+    }, 0);
+  }
+
+  function downloadBlob(blob, filename) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    a.click();
+    // Revocar de inmediato puede cortar la descarga en algunos navegadores
+    // si el archivo es grande y la escritura a disco todavía no terminó;
+    // se revoca más tarde, sin apuro.
+    setTimeout(() => URL.revokeObjectURL(a.href), 30000);
+  }
+
+  // Si el usuario marcó "exportar solo dentro de algún volumen", filtra
+  // usando las columnas dentro__<valor> ya calculadas (sin depender del
+  // texto exacto de la columna resumen ni de "noneLabel"): un bloque
+  // cuenta si al menos una de esas columnas quedó en 'sí'. .filter() sobre
+  // un arreglo de objetos solo copia las REFERENCIAS que pasan el filtro,
+  // no los objetos — por eso es seguro aunque el modelo tenga millones de
+  // filas: en el peor caso (nada filtrado) el costo extra es un arreglo de
+  // punteros, no una segunda copia de los datos.
+  function getExportRowsVol() {
+    const onlyInside = document.getElementById('volExportOnlyInside').checked;
+    if (!onlyInside) return state4.results;
+    const colNames = state4._colNames;
+    return state4.results.filter((r) => colNames.some((c) => r[c] === 'sí'));
+  }
+
+  document.getElementById('btnExportXlsxVol').addEventListener('click', (e) => {
     if (!state4.results) return;
-    if (state4.results.length > XLSX_MAX_ROWS) {
-      alert('El modelo tiene ' + state4.results.length.toLocaleString() + ' bloques, más de los ' + XLSX_MAX_ROWS.toLocaleString() + ' que soporta una hoja de Excel (.xlsx). Usa "Descargar CSV" en su lugar — no tiene ese límite y es más liviano para archivos así de grandes.');
+    const exportRows = getExportRowsVol();
+    if (!exportRows.length) { alert('No hay bloques para exportar con el filtro actual.'); return; }
+    if (exportRows.length > XLSX_MAX_ROWS) {
+      alert('Hay ' + exportRows.length.toLocaleString() + ' bloques para exportar, más de los ' + XLSX_MAX_ROWS.toLocaleString() + ' que soporta una hoja de Excel (.xlsx). Usa "Descargar CSV" en su lugar — no tiene ese límite y es más liviano para archivos así de grandes.');
       return;
     }
-    const headers = state4.blocks.headers.concat(state4._colNames).concat([state4._summaryColName]);
-    const wb = XLSX.utils.book_new();
-    const ws = XLSX.utils.json_to_sheet(state4.results, { header: headers });
-    XLSX.utils.book_append_sheet(wb, ws, 'Modelo clasificado');
-    XLSX.writeFile(wb, 'flageador_bloques_volumenes.xlsx');
+    runBusy(e.currentTarget, 'Generando Excel…', () => {
+      const headers = state4.blocks.headers.concat(state4._colNames).concat([state4._summaryColName]);
+      const wb = XLSX.utils.book_new();
+      const ws = XLSX.utils.json_to_sheet(exportRows, { header: headers });
+      XLSX.utils.book_append_sheet(wb, ws, 'Modelo clasificado');
+      XLSX.writeFile(wb, 'flageador_bloques_volumenes.xlsx');
+    });
   });
 
   function csvCellVol(v) {
@@ -3157,32 +3209,43 @@ const FLG = (function () {
     return v;
   }
 
-  document.getElementById('btnExportCsvVol').addEventListener('click', () => {
+  document.getElementById('btnExportCsvVol').addEventListener('click', (e) => {
     if (!state4.results || !state4.results.length) return;
-    const headers = state4.blocks.headers.concat(state4._colNames).concat([state4._summaryColName]);
-    const rows = state4.results;
-    // Se acumulan las líneas como partes de Blob separadas en vez de
-    // armar un solo string gigante con lines.join('\n'): un Blob puede
-    // recibir un arreglo de miles/millones de strings pequeños sin que el
-    // motor JS tenga que reservar de una vez un único bloque de memoria
-    // contiguo del tamaño completo del CSV (que para 2.6M filas puede ser
-    // de varios cientos de MB), evitando ese pico de asignación única.
-    const parts = ['﻿' + headers.map(csvCellVol).join(';') + '\n'];
-    for (let i = 0; i < rows.length; i++) {
-      const r = rows[i];
-      let line = '';
-      for (let j = 0; j < headers.length; j++) {
-        if (j) line += ';';
-        line += csvCellVol(r[headers[j]]);
+    const exportRows = getExportRowsVol();
+    if (!exportRows.length) { alert('No hay bloques para exportar con el filtro actual.'); return; }
+    runBusy(e.currentTarget, 'Generando CSV…', () => {
+      const headers = state4.blocks.headers.concat(state4._colNames).concat([state4._summaryColName]);
+      const rows = exportRows;
+      // Un solo arreglo de ~2.6M strings de línea (aunque no se junten en
+      // un string final con join) sigue siendo, en la práctica, casi tanta
+      // memoria viva como el propio modelo de bloques que ya está cargado
+      // — no alcanzaba. Acá se arma el CSV en LOTES: cada CHUNK_ROWS filas
+      // se convierte de inmediato en su propio Blob (que el navegador
+      // guarda como bytes, no como strings de JS) y las strings de ese
+      // lote quedan libres para el recolector de basura antes de seguir
+      // con el siguiente lote. Al final se combinan los Blobs de cada
+      // lote en uno solo — concatenar Blobs no requiere volver a copiar
+      // todo el texto en un string de JS.
+      const CHUNK_ROWS = 20000;
+      const blobParts = [];
+      let buf = ['﻿' + headers.map(csvCellVol).join(';') + '\n'];
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i];
+        let line = '';
+        for (let j = 0; j < headers.length; j++) {
+          if (j) line += ';';
+          line += csvCellVol(r[headers[j]]);
+        }
+        buf.push(line + '\n');
+        if (buf.length >= CHUNK_ROWS) {
+          blobParts.push(new Blob(buf, { type: 'text/csv;charset=utf-8;' }));
+          buf = [];
+        }
       }
-      parts.push(line + '\n');
-    }
-    const blob = new Blob(parts, { type: 'text/csv;charset=utf-8;' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'flageador_bloques_volumenes.csv';
-    a.click();
-    URL.revokeObjectURL(a.href);
+      if (buf.length) blobParts.push(new Blob(buf, { type: 'text/csv;charset=utf-8;' }));
+      const blob = new Blob(blobParts, { type: 'text/csv;charset=utf-8;' });
+      downloadBlob(blob, 'flageador_bloques_volumenes.csv');
+    });
   });
 
   // ============================================================================

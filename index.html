@@ -253,7 +253,14 @@
     background: var(--bg-inset); border:1px solid var(--border-soft); border-radius: var(--radius-sm);
     padding: 8px 10px; font-size:12px;
   }
-  .vol-item .vol-name{ color: var(--text); font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .vol-item .vol-name{ color: var(--text); font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:34%; flex-shrink:1; }
+  .vol-item .vol-label-wrap{ display:flex; align-items:center; gap:5px; flex-shrink:0; }
+  .vol-item .vol-label-wrap label{ color: var(--text-faint); font-size:11px; }
+  .vol-item .vol-label{
+    width:110px; background: var(--bg-panel-2); border:1px solid var(--border); border-radius:4px;
+    color: var(--text); font-size:12px; padding:3px 6px; font-family: var(--mono);
+  }
+  .vol-item .vol-label:focus{ outline:none; border-color: var(--accent); }
   .vol-item .vol-tri{ color: var(--text-faint); font-family: var(--mono); font-size:11px; margin-left:auto; flex-shrink:0; }
   .vol-item .vol-remove{
     flex-shrink:0; width:20px; height:20px; border-radius:50%;
@@ -760,7 +767,7 @@
     <!-- VOLUMENES DXF -->
     <div class="card" id="cardVolumes">
       <h3>Volúmenes (DXF) <span class="req">obligatorio</span></h3>
-      <p class="desc">Cada archivo DXF debe ser un sólido cerrado (malla triangulada). Puedes arrastrar varios archivos a la vez, o ir agregándolos de a uno — cada uno se trata como un volumen independiente (nombrado por el archivo).</p>
+      <p class="desc">Cada archivo DXF debe ser un sólido cerrado (malla triangulada). Puedes arrastrar varios archivos a la vez, o ir agregándolos de a uno — cada uno se trata como un volumen independiente. El "Valor" de cada volumen (editable, junto a su nombre) es el que se usa en la columna resumen y en el nombre de su columna "dentro__" — útil, por ejemplo, para que un archivo de una fase o período (ej. <code>fase_2025.dxf</code>) escriba simplemente <code>2025</code> en el resultado.</p>
       <div class="dropzone" id="dzVolumes">
         <input type="file" id="fileVolumes" accept=".dxf" multiple>
         <div class="dz-label"><strong>Arrastra uno o varios DXF aquí</strong><br>o haz clic para elegirlos</div>
@@ -794,7 +801,7 @@
         <input type="text" id="volNoneLabel" value="ninguno">
       </div>
     </div>
-    <div class="helptext">Además de la columna resumen, se agrega una columna "dentro__&lt;nombre del volumen&gt;" (sí/no) por cada archivo DXF cargado.</div>
+    <div class="helptext">Además de la columna resumen, se agrega una columna "dentro__&lt;valor del volumen&gt;" (sí/no) por cada volumen cargado, usando el "Valor" que le hayas asignado a cada uno en la lista de volúmenes.</div>
   </div>
 
   <!-- STEP 3 -->
@@ -1459,21 +1466,42 @@ const FLG = (function () {
 
   function parseCSV(text, opts) {
     opts = opts || {};
-    text = text.replace(/^﻿/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-    const allLines = text.split('\n');
-    const lines = allLines.filter((l, idx) => !(idx === allLines.length - 1 && l.trim() === ''));
-    if (lines.length === 0) return { headers: [], rows: [], delimiter: ';' };
-    const delimiter = opts.delimiter || detectDelimiter(lines[0]);
-    const headers = splitCsvLine(lines[0], delimiter).map(h => h.trim());
+    // Recorre el texto línea por línea con indexOf()/slice() en vez de
+    // text.replace(...).replace(...).replace(...) + text.split('\n') +
+    // .filter(...): la versión anterior construía, para un archivo de
+    // cientos de MB, varias copias completas del string (cada .replace
+    // sobre todo el archivo genera un string nuevo) más un arreglo con una
+    // entrada por línea (y luego otro casi idéntico via filter) — toda esa
+    // memoria transitoria se sumaba junto en el momento de carga, además de
+    // las filas ya parseadas. slice() sobre un string grande no copia el
+    // contenido (V8 lo representa como una vista/"sliced string" sobre el
+    // string original), así que este recorrido evita esas copias.
+    if (text.length && text.charCodeAt(0) === 0xFEFF) text = text.slice(1); // BOM UTF-8
+    const len = text.length;
+    let delimiter = opts.delimiter || null;
+    let headers = null;
     const rows = [];
-    for (let i = 1; i < lines.length; i++) {
-      if (lines[i].trim() === '') continue;
-      const vals = splitCsvLine(lines[i], delimiter);
-      const row = {};
-      for (let j = 0; j < headers.length; j++) row[headers[j]] = vals[j] !== undefined ? vals[j].trim() : '';
-      rows.push(row);
+    let i = 0;
+    let sawAnyLine = false;
+    while (i < len) {
+      const nl = text.indexOf('\n', i);
+      const end = nl === -1 ? len : nl;
+      let line = text.slice(i, end);
+      if (line.length && line.charCodeAt(line.length - 1) === 13) line = line.slice(0, -1); // \r de CRLF
+      i = nl === -1 ? len : nl + 1;
+      sawAnyLine = true;
+      if (headers === null) {
+        delimiter = delimiter || detectDelimiter(line);
+        headers = splitCsvLine(line, delimiter).map(h => h.trim());
+      } else if (line.trim() !== '') {
+        const vals = splitCsvLine(line, delimiter);
+        const row = {};
+        for (let j = 0; j < headers.length; j++) row[headers[j]] = vals[j] !== undefined ? vals[j].trim() : '';
+        rows.push(row);
+      }
     }
-    return { headers, rows, delimiter };
+    if (!sawAnyLine) return { headers: [], rows: [], delimiter: delimiter || ';' };
+    return { headers, rows, delimiter: delimiter || ';' };
   }
 
   function parseWorkbook(arrayBuffer) {
@@ -2789,7 +2817,8 @@ const FLG = (function () {
     state4.volumes.forEach((vol, idx) => {
       const div = document.createElement('div');
       div.className = 'vol-item';
-      div.innerHTML = '<span class="vol-name">' + escapeHtml(vol.name) + '</span>' +
+      div.innerHTML = '<span class="vol-name" title="' + escapeHtml(vol.name) + '">' + escapeHtml(vol.name) + '</span>' +
+        '<span class="vol-label-wrap"><label>Valor:</label><input type="text" class="vol-label" data-idx="' + idx + '" value="' + escapeHtml(vol.label) + '"></span>' +
         '<span class="vol-tri">' + vol.triCount.toLocaleString() + ' triángulos</span>' +
         '<button type="button" class="vol-remove" title="Quitar" data-idx="' + idx + '">×</button>';
       wrap.appendChild(div);
@@ -2801,6 +2830,14 @@ const FLG = (function () {
         renderVolumeList();
         updateRunButtonVol();
       });
+    });
+    wrap.querySelectorAll('.vol-label').forEach((input) => {
+      input.addEventListener('input', (e) => {
+        const idx = parseInt(e.currentTarget.getAttribute('data-idx'), 10);
+        const v = e.currentTarget.value.trim();
+        state4.volumes[idx].label = v || state4.volumes[idx].name;
+      });
+      input.addEventListener('click', (e) => e.stopPropagation());
     });
   }
 
@@ -2836,7 +2873,7 @@ const FLG = (function () {
         for (const name of m.layerNames) { parts.push(m.layers[name]); totalTri += m.layers[name].length / 9; }
         const merged = mergeFloat64Arrays(parts);
         const volName = file.name.replace(/\.dxf$/i, '');
-        state4.volumes.push({ name: volName, triangles: merged, triCount: totalTri });
+        state4.volumes.push({ name: volName, label: volName, triangles: merged, triCount: totalTri });
         renderVolumeList();
         updateRunButtonVol();
         worker.terminate();
@@ -2890,12 +2927,14 @@ const FLG = (function () {
     const n = rows.length;
     const bx = new Float64Array(n), by = new Float64Array(n), bz = new Float64Array(n);
     const validIdx = [];
+    const validMask = new Uint8Array(n);
     for (let i = 0; i < n; i++) {
       const x = FLG.toNumber(rows[i][colX]), y = FLG.toNumber(rows[i][colY]), z = FLG.toNumber(rows[i][colZ]);
       if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
       const j = validIdx.length;
       bx[j] = x; by[j] = y; bz[j] = z;
       validIdx.push(i);
+      validMask[i] = 1;
     }
     const m = validIdx.length;
 
@@ -2911,8 +2950,11 @@ const FLG = (function () {
     // copias independientes (slice) de los triángulos de cada volumen y de
     // las posiciones de bloque, para poder transferir sus buffers sin
     // "neutrear" los datos guardados en state4 (permite volver a correr sin
-    // recargar nada si el usuario solo cambia los nombres de columna).
-    const volumesCopy = state4.volumes.map((v) => ({ name: v.name, triangles: v.triangles.slice() }));
+    // recargar nada si el usuario solo cambia los nombres de columna o el
+    // valor/label de un volumen). Se usa el "label" editable de cada volumen
+    // (por defecto, el nombre del archivo) como identificador de columna y
+    // de valor en el resumen — no el nombre interno.
+    const volumesCopy = state4.volumes.map((v) => ({ name: v.label, triangles: v.triangles.slice() }));
     const bxT = bx.slice(0, m), byT = by.slice(0, m), bzT = bz.slice(0, m);
     const transferList = [bxT.buffer, byT.buffer, bzT.buffer];
     for (const v of volumesCopy) transferList.push(v.triangles.buffer);
@@ -2927,41 +2969,49 @@ const FLG = (function () {
         document.getElementById('runBtnVol').disabled = false;
         worker.terminate();
       } else if (msgData.type === 'complete_classify_volumes') {
-        const volResults = msgData.results; // [{name, inside: Uint8Array}]
-        const results = rows.map((r) => Object.assign({}, r));
+        const volResults = msgData.results; // [{name, inside: Uint8Array}] — name = label elegido por el usuario
+        const colNames = volResults.map((vr) => 'dentro__' + vr.name);
 
-        for (let i = 0; i < n; i++) {
-          for (const vr of volResults) results[i]['dentro__' + vr.name] = 'no';
-          results[i][summaryColName] = noneLabel;
-        }
-
-        const perBlockNames = new Array(n);
-        for (let i = 0; i < n; i++) perBlockNames[i] = [];
-        for (const vr of volResults) {
-          for (let j = 0; j < m; j++) {
-            if (vr.inside[j]) {
-              const i = validIdx[j];
-              results[i]['dentro__' + vr.name] = 'sí';
-              perBlockNames[i].push(vr.name);
-            }
-          }
-        }
-        for (let i = 0; i < n; i++) {
-          if (perBlockNames[i].length) results[i][summaryColName] = perBlockNames[i].join(', ');
-        }
-        const validSet = new Set(validIdx);
-        for (let i = 0; i < n; i++) {
-          if (!validSet.has(i)) {
-            results[i][summaryColName] = 'sin_coordenadas';
-            for (const vr of volResults) results[i]['dentro__' + vr.name] = '';
-          }
+        // Se agregan las columnas nuevas MUTANDO el modelo de bloques ya
+        // cargado (`rows`), en vez de duplicar todo el arreglo con
+        // `rows.map(Object.assign)`. Con modelos de cientos de MB / millones
+        // de filas esa copia completa casi duplicaba la memoria pico
+        // necesaria justo en el momento más ajustado — la causa más probable
+        // de que la pestaña quede en blanco por falta de memoria. Si es una
+        // segunda corrida (cambiaste labels o el nombre de la columna
+        // resumen), primero se limpian las columnas que había dejado la
+        // corrida anterior para no acumular columnas viejas.
+        if (state4._colNames) {
+          const staleCols = state4._colNames.slice();
+          if (state4._summaryColName && state4._summaryColName !== summaryColName) staleCols.push(state4._summaryColName);
+          for (let i = 0; i < n; i++) { for (const c of staleCols) delete rows[i][c]; }
         }
 
         let totalDentroAlguno = 0;
-        for (let i = 0; i < n; i++) if (perBlockNames[i].length) totalDentroAlguno++;
+        for (let i = 0; i < n; i++) {
+          if (!validMask[i]) {
+            rows[i][summaryColName] = 'sin_coordenadas';
+            for (const c of colNames) rows[i][c] = '';
+            continue;
+          }
+          for (const c of colNames) rows[i][c] = 'no';
+          rows[i][summaryColName] = noneLabel;
+        }
+        for (const vr of volResults) {
+          const col = 'dentro__' + vr.name;
+          for (let j = 0; j < m; j++) {
+            if (!vr.inside[j]) continue;
+            const i = validIdx[j];
+            rows[i][col] = 'sí';
+            rows[i][summaryColName] = (rows[i][summaryColName] === noneLabel) ? vr.name : rows[i][summaryColName] + ', ' + vr.name;
+          }
+        }
+        for (let i = 0; i < n; i++) {
+          if (validMask[i] && rows[i][summaryColName] !== noneLabel) totalDentroAlguno++;
+        }
 
-        state4.results = results;
-        state4._colNames = volResults.map((vr) => 'dentro__' + vr.name);
+        state4.results = rows;
+        state4._colNames = colNames;
         state4._summaryColName = summaryColName;
         state4.stats = {
           total: n,

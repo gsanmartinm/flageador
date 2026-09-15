@@ -117,7 +117,7 @@ Igual que en Composita, la detección es solo una sugerencia editable — el usu
 
 ## 11. Estado actual
 
-`index.html` en esta carpeta implementa Fase 1, Fase 2 y Fase 3. Probado con datos reales del proyecto: Modo 1/2 con `BM_fas.csv`/`MuestrasPFS_FAS.csv` (`test_GMLC/`) — motor de vecino más cercano validado contra fuerza bruta, integración end-to-end con las 198 muestras reales, wiring de UI del Modo 2 verificado con jsdom. Modo 3 probado con el motor de clasificación aislado en Node (ver sección 12.5): parser DXF, índice 2D de triángulos y clasificación aire/depósito, todos verificados contra fuerza bruta y contra la estructura real de `test_ANT/Ant_10_EOY_CD2025_2S2029.dxf`.
+`index.html` en esta carpeta implementa Fase 1, Fase 2, Fase 3 y Modo 4. Probado con datos reales del proyecto: Modo 1/2 con `BM_fas.csv`/`MuestrasPFS_FAS.csv` (`test_GMLC/`) — motor de vecino más cercano validado contra fuerza bruta, integración end-to-end con las 198 muestras reales, wiring de UI del Modo 2 verificado con jsdom. Modo 3 probado con el motor de clasificación aislado en Node (ver sección 12.5): parser DXF, índice 2D de triángulos y clasificación aire/depósito, todos verificados contra fuerza bruta y contra la estructura real de `test_ANT/Ant_10_EOY_CD2025_2S2029.dxf`. **Modo 4 implementado y revisado manualmente línea por línea (ver sección 13.5); pendiente de pruebas unitarias automatizadas y de verificación end-to-end en navegador por un problema de infraestructura ajeno al código (ver 13.5).**
 
 ## 12. Modo 3 — Bloque vs. Topografía (DXF)
 
@@ -160,3 +160,50 @@ Motor extraído a `dxf_engine.js` (Node, con `module.exports`) para pruebas unit
 - Rendimiento: ~100,000 triángulos indexados en 17ms; 5,000 consultas de clasificación en 4ms (0.0008 ms/consulta) — a la escala real del DXF de prueba (~1.34M triángulos, ~171,764 bloques) esto proyecta un tiempo total del orden de unos pocos segundos, no minutos.
 - Estructura real verificada directamente sobre `test_ANT/Ant_10_EOY_CD2025_2S2029.dxf`: formato de entidad `3DFACE` (handle, owner, capa, color, vértices) idéntico al asumido por el parser, incluyendo bloques de datos extendidos (XDATA, códigos 1000/1001: Material, Label, Element name, File Name, Object Name) que el parser ignora correctamente sin desincronizarse; capa única (`10_EOY_CD2025_2S2029_3D_10`) confirmada en tres puntos distintos del archivo; rango de coordenadas reales (X ~407,000–414,076; Y ~7,493,430–7,505,454; Z real por vértice ~1,670–1,700 en la muestra inspeccionada) consistente con el modelo de bloques de prueba (`Block_Model_Mineralogy_PtXt_2021011.csv`, 171,763 bloques, columnas `midx/midy/midz` reconocidas automáticamente por la misma heurística de nombres que Modo 1).
 - Pendiente (no realizable en este entorno): una corrida end-to-end real dentro de un navegador con el archivo DXF completo (~1.34M triángulos) y el modelo de bloques completo, dado que este entorno de desarrollo no tiene acceso a un navegador real ni al archivo montado en el sandbox de pruebas. Se recomienda al usuario probar Modo 3 directamente en `index.html` con los archivos de `test_ANT/` como primera verificación real.
+
+## 13. Modo 4 — Bloque vs. Volúmenes DXF
+
+### 13.1 Problema y alcance
+
+Dado un modelo de bloques y uno o más volúmenes cerrados (sólidos triangulados en DXF, entidades `3DFACE`), determinar para cada bloque si su centroide queda **dentro** o **fuera** de cada volumen, agregando una columna `dentro__<nombre_volumen>` por cada volumen cargado más una columna resumen (nombre configurable, default `volumenes_dxf`) que lista los nombres de los volúmenes que contienen a ese bloque (o una etiqueta configurable, default `ninguno`, si no está dentro de ninguno). A diferencia del Modo 3 (que clasifica contra una superficie abierta tipo "manto"), aquí el DXF representa un sólido cerrado (una veta, un cuerpo mineralizado, un pit de diseño, etc.) y la pregunta es de contención 3D, no de "arriba/abajo" de una superficie.
+
+Se decidió, consultado con el usuario, soportar **varios volúmenes a la vez** en una sola corrida: el usuario carga N archivos DXF (uno por volumen) y el resultado incluye la clasificación contra cada uno más el resumen combinado, en vez de tener que repetir el proceso volumen por volumen.
+
+### 13.2 Por qué no basta con el índice 2D del Modo 3
+
+El Modo 3 resuelve "¿qué altura tiene la topografía en (x,y)?" — una consulta 2D con una única respuesta por columna XY, adecuada para una superficie (cada XY tiene una sola Z de techo). La pregunta de Modo 4 es distinta: "¿este punto 3D está dentro de un sólido cerrado?", que no se puede reducir a una sola consulta 2D porque el sólido puede tener múltiples caras superpuestas en la misma columna XY (paredes verticales, cavidades, geometría no convexa).
+
+La técnica estándar para este problema es **ray casting / point-in-polyhedron**: desde el punto de consulta se lanza un rayo en una dirección arbitraria y se cuenta cuántas veces cruza la superficie del sólido; si el conteo es impar, el punto está dentro (regla de paridad). Esto requiere intersección rayo-triángulo (no punto-en-triángulo-2D como en Modo 3) y es válido para cualquier sólido cerrado y watertight, sin importar su forma.
+
+**Riesgo de un solo rayo:** si el rayo pasa exactamente rasante a una arista o cara del mesh (coplanar u "grazing"), el conteo de intersecciones puede quedar mal definido (ni claramente par ni impar) por errores de redondeo de punto flotante — un riesgo real en mallas mineras que suelen tener bancos horizontales y paredes verticales, es decir, caras alineadas con los ejes en ambas orientaciones. Un rayo puramente `+Z` es especialmente vulnerable contra bancos horizontales; un rayo puramente `+X` o `+Y` lo es contra paredes verticales alineadas a esos ejes.
+
+**Solución adoptada — votación por mayoría de 3 rayos:** se lanzan 3 rayos por punto, cada uno mayormente alineado a un eje distinto pero con una pequeña inclinación no-axis-aligned (`RAY_Z ≈ (0.057, -0.081, 1)` normalizado, y análogos para `RAY_X`/`RAY_Y`), de forma que ningún rayo sea exactamente paralelo a las caras típicas de una malla minera. El punto se considera "dentro" si al menos 2 de los 3 rayos reportan paridad impar. Esto tolera que un rayo individual falle en un caso degenerado puntual sin afectar el resultado final.
+
+### 13.3 Intersección rayo-triángulo (Möller–Trumbore)
+
+Implementada directamente (`rayTriangleIntersect`) siguiendo el algoritmo estándar de Möller–Trumbore: expresa el punto de intersección en coordenadas baricéntricas (u, v) del triángulo más la distancia `t` a lo largo del rayo, descartando la intersección si el rayo es casi paralelo al plano del triángulo (`|det| < epsilon`), si (u, v) caen fuera del triángulo, o si `t` es negativo o ~0 (intersección detrás del origen del rayo o exactamente en él — se usa `t > 1e-7` como umbral para evitar contar dos veces una intersección que cae justo en un vértice/arista compartido por dos triángulos).
+
+### 13.4 Índice espacial generalizado (`AxisGrid2D`) + `buildVolumeIndex`
+
+Para no probar los ~5,000+ triángulos de cada volumen contra cada rayo de cada bloque, se generalizó la grilla CSR 2D del Modo 3 (`TriGrid2D`, fija a los ejes X/Y) a `AxisGrid2D(triangles, axisA, axisB)`, parametrizable sobre cualquier par de ejes. Como los 3 rayos de la votación viajan mayormente en direcciones distintas, cada uno necesita proyectar candidatos sobre un plano distinto:
+
+- Rayo mayormente `+Z` → candidatos por proyección XY (`gridXY`, igual que Modo 3).
+- Rayo mayormente `+X` → candidatos por proyección YZ (`gridYZ`).
+- Rayo mayormente `+Y` → candidatos por proyección XZ (`gridXZ`).
+
+`buildVolumeIndex(triangles)` calcula el bounding box real del volumen (nunca los `$EXTMIN`/`$EXTMAX` del header DXF, que en los archivos de prueba `test_MINSUR` son valores centinela `±1e20` — confirmando que la extensión siempre debe derivarse de los vértices reales, mismo criterio ya aplicado en Modo 3) y construye las 3 grillas. Como cada rayo tiene una leve inclinación respecto a su eje dominante, un punto de consulta puede desviarse lateralmente varias celdas a lo largo del recorrido del rayo dentro del volumen; `padFor` calcula dinámicamente cuántas celdas de radio hay que buscar alrededor de la celda inicial (proporcional a la inclinación del rayo y a la extensión del volumen en su eje dominante, acotado entre 1 y 40) para no perder triángulos candidatos por los que el rayo efectivamente pasa.
+
+**Deduplicación sin asignar memoria por consulta:** un mismo triángulo puede quedar registrado en varias celdas superpuestas del vecindario buscado. En vez de crear un `Set` nuevo por cada consulta (costoso a la escala de cientos de miles de bloques), se usa un buffer compartido `visited` (`Int32Array` del tamaño del total de triángulos) junto con un contador `epoch` que se incrementa en cada consulta; un candidato ya visto en la consulta actual tiene `visited[idx] === epoch`.
+
+### 13.5 Pruebas realizadas y pendientes
+
+Se extendió `dxf_engine.js` (motor Node del Modo 3) con `AxisGrid2D`, `rayTriangleIntersect`, `buildVolumeIndex`, `countParity`, `pointInMesh` y `classifyBlocksInVolumes`, y se verificó su sintaxis (`node --check`) exitosamente.
+
+**Estructura real verificada** directamente sobre `test_MINSUR/ms-cu40n-I.dxf` y `ms-cu40n-II.dxf`: versión DXF `AC1012` (AutoCAD R13), entidades `3DFACE` en capa única `"0"` (sin capas nombradas ni XDATA, a diferencia de `test_ANT`), confirmando que el parser existente (ya simplificado a solo `3DFACE`) funciona sin cambios. Volúmenes de tamaño moderado (miles de triángulos cada uno), muy por debajo de la escala de `test_ANT`, sin riesgo de performance.
+
+**Pendiente por un problema de infraestructura, no de diseño:** el sandbox de shell (`bash`) de este entorno dejó de funcionar durante esta sesión (falla de montaje de archivos, reportada como una regresión conocida y rastreada, causada por una actualización de Windows del 8 de septiembre — no relacionada con el código de Flageador) y no se recuperó pese a reintentos espaciados en distintos momentos de la sesión. Como consecuencia, no fue posible ejecutar en este entorno:
+
+- Las pruebas unitarias planeadas para el motor de punto-en-malla (cubo y tetraedro sintéticos con puntos dentro/fuera conocidos, comparación contra fuerza bruta, prueba de robustez de rayos degenerados/rasantes, prueba de rendimiento a la escala real de `test_MINSUR`).
+- Una verificación funcional real (ej. que el centroide del bounding box de un volumen clasifique como "dentro" de sí mismo) contra los archivos reales de `test_MINSUR`.
+
+Todo el código nuevo (worker: `AxisGrid2D`, `rayTriangleIntersect`, `buildVolumeIndex`, `countParity`, `pointInMesh`, `doClassifyVolumes`; UI: `state4`, carga multi-archivo de volúmenes, corrida, resultados, exportación) fue revisado manualmente línea por línea como sustituto parcial de las pruebas automatizadas, sin encontrar errores — pero esta revisión no reemplaza una corrida real. **Se recomienda al usuario probar Modo 4 directamente en `index.html` con los archivos de `test_MINSUR/` como primera verificación real**, antes de usarlo con datos de producción.
